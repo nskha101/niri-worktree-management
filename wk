@@ -1,0 +1,827 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ===== Configuration =====
+WK_CONFIG="${WK_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/wk/wk.conf}"
+
+# Defaults (override in wk.conf)
+MAIN_REPO=""
+WORKTREE_BASE="$HOME/worktrees"
+WT_PREFIX=""
+BASE_BRANCH="origin/main"
+MERGE_TARGET="main"
+EXCLUDED_BRANCHES="main"
+POST_CREATE_CMD=""
+COPY_FILES=".env"
+EDITOR_CMD="code {dir}"
+TERMINAL_CMD=""
+BROWSER_CMD=""
+BROWSER_URL=""
+
+# Load user config
+if [[ -f "$WK_CONFIG" ]]; then
+    # shellcheck source=/dev/null
+    source "$WK_CONFIG"
+fi
+
+# ===== Colors & Logging =====
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+YELLOW='\033[0;33m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+info()  { echo -e "${BLUE}[info]${NC}  $*"; }
+step()  { echo -e "${CYAN}[step]${NC}  $*"; }
+done_() { echo -e "${GREEN}[done]${NC}  $*"; }
+warn()  { echo -e "${YELLOW}[warn]${NC}  $*"; }
+err()   { echo -e "${RED}[error]${NC} $*" >&2; }
+
+# ===== Helpers =====
+
+usage() {
+    echo -e "${BOLD}wk${NC} - Niri Worktree Manager"
+    echo ""
+    echo "Usage: wk [command] [args]"
+    echo ""
+    echo "Commands:"
+    echo "  (none)    Interactive menu"
+    echo "  create    Create a new worktree and workspace"
+    echo "  list      List worktrees and open/manage them"
+    echo "  delete    Close and clean up a worktree"
+    echo "  init      Create or edit the config file"
+    echo "  help      Show this help"
+    echo ""
+    echo "Config: $WK_CONFIG"
+}
+
+cmd_init() {
+    local config_dir
+    config_dir=$(dirname "$WK_CONFIG")
+    mkdir -p "$config_dir"
+
+    if [[ -f "$WK_CONFIG" ]]; then
+        info "Config already exists at ${WK_CONFIG}"
+        read -rp "Open in editor? [Y/n] " answer
+        if [[ ! "$answer" =~ ^[Nn]$ ]]; then
+            "${EDITOR:-vi}" "$WK_CONFIG"
+        fi
+        return
+    fi
+
+    # Find the example config relative to the script location
+    local script_dir
+    script_dir=$(dirname "$(readlink -f "$0")")
+    local example="$script_dir/wk.conf.example"
+
+    if [[ -f "$example" ]]; then
+        cp "$example" "$WK_CONFIG"
+    else
+        cat > "$WK_CONFIG" <<'CONF'
+# wk - Niri Worktree Manager configuration
+# See wk.conf.example for all options
+
+# REQUIRED: Path to your main git repository
+MAIN_REPO=""
+
+# Base directory for worktrees (default: ~/worktrees)
+# WORKTREE_BASE="$HOME/worktrees"
+
+# Prefix for worktree directories (default: repo name)
+# WT_PREFIX=""
+
+# Branch to create new branches from (default: origin/main)
+# BASE_BRANCH="origin/main"
+CONF
+    fi
+
+    done_ "Config created at ${WK_CONFIG}"
+    info "Edit it to set your MAIN_REPO path."
+    read -rp "Open in editor now? [Y/n] " answer
+    if [[ ! "$answer" =~ ^[Nn]$ ]]; then
+        "${EDITOR:-vi}" "$WK_CONFIG"
+    fi
+}
+
+# Handle commands that don't need config validation
+case "${1:-}" in
+    init)           cmd_init; exit 0 ;;
+    help|-h|--help) usage; exit 0 ;;
+esac
+
+# Validate required config
+if [[ -z "$MAIN_REPO" ]]; then
+    err "MAIN_REPO is not set."
+    echo -e "  Configure it in: ${BOLD}${WK_CONFIG}${NC}" >&2
+    echo -e "  Run ${BOLD}wk init${NC} to create a config file." >&2
+    exit 1
+fi
+
+# Default prefix from repo directory name
+if [[ -z "$WT_PREFIX" ]]; then
+    WT_PREFIX=$(basename "$MAIN_REPO")
+fi
+
+preflight() {
+    for cmd in fzf jq; do
+        if ! command -v "$cmd" &>/dev/null; then
+            err "$cmd is required. Install with: pacman -S $cmd"
+            exit 1
+        fi
+    done
+
+    if [[ ! -d "$MAIN_REPO/.git" ]]; then
+        err "Main repo not found at $MAIN_REPO"
+        exit 1
+    fi
+
+    cd "$MAIN_REPO"
+}
+
+# Strip username prefix from branch for niri workspace name
+# e.g. "user/my-feature" -> "my-feature", "plain-branch" -> "plain-branch"
+ws_name() {
+    local branch="$1"
+    echo "${branch#*/}"
+}
+
+resolve_wt_dir() {
+    local branch="$1"
+    echo "$WORKTREE_BASE/${WT_PREFIX}-${branch}"
+}
+
+relative_time() {
+    local iso_date="$1"
+    local then_epoch now_epoch diff
+
+    then_epoch=$(date -d "$iso_date" +%s 2>/dev/null) || { echo "unknown"; return; }
+    now_epoch=$(date +%s)
+    diff=$(( now_epoch - then_epoch ))
+
+    if (( diff < 60 )); then
+        echo "just now"
+    elif (( diff < 3600 )); then
+        echo "$(( diff / 60 ))m ago"
+    elif (( diff < 86400 )); then
+        echo "$(( diff / 3600 ))h ago"
+    elif (( diff < 604800 )); then
+        echo "$(( diff / 86400 ))d ago"
+    elif (( diff < 2592000 )); then
+        echo "$(( diff / 604800 ))w ago"
+    else
+        echo "$(( diff / 2592000 ))mo ago"
+    fi
+}
+
+# Populate WT_BRANCHES, WT_PATHS, WT_DATES, WT_COMMITS, WT_RELATIVE
+# Sorted by committer date descending (most recent first)
+gather_worktrees() {
+    WT_BRANCHES=()
+    WT_PATHS=()
+    WT_DATES=()
+    WT_COMMITS=()
+    WT_RELATIVE=()
+
+    local tmp_branches=() tmp_paths=() tmp_dates=() tmp_commits=()
+
+    while IFS= read -r line; do
+        local wt_path wt_branch
+        wt_path=$(awk '{print $1}' <<< "$line")
+        wt_branch=$(sed -n 's/.*\[//;s/\]//p' <<< "$line")
+
+        [[ "$wt_path" == "$MAIN_REPO" ]] && continue
+        [[ "$wt_path" == "$WORKTREE_BASE"/${WT_PREFIX}-* ]] || continue
+
+        local commit_date commit_msg
+        commit_date=$(git log --format='%ci' -1 "$wt_branch" 2>/dev/null || echo "1970-01-01 00:00:00 +0000")
+        commit_msg=$(git log --oneline -1 "$wt_branch" 2>/dev/null || echo "unknown")
+
+        tmp_branches+=("$wt_branch")
+        tmp_paths+=("$wt_path")
+        tmp_dates+=("$commit_date")
+        tmp_commits+=("$commit_msg")
+    done < <(git worktree list)
+
+    if [[ ${#tmp_branches[@]} -eq 0 ]]; then
+        return
+    fi
+
+    # Sort by date descending using decorated-sort-undecorate
+    local sorted_indices
+    sorted_indices=$(
+        for i in "${!tmp_dates[@]}"; do
+            echo "$i $(date -d "${tmp_dates[$i]}" +%s 2>/dev/null || echo 0)"
+        done | sort -k2 -nr | awk '{print $1}'
+    )
+
+    while IFS= read -r idx; do
+        WT_BRANCHES+=("${tmp_branches[$idx]}")
+        WT_PATHS+=("${tmp_paths[$idx]}")
+        WT_DATES+=("${tmp_dates[$idx]}")
+        WT_COMMITS+=("${tmp_commits[$idx]}")
+        WT_RELATIVE+=("$(relative_time "${tmp_dates[$idx]}")")
+    done <<< "$sorted_indices"
+}
+
+get_niri_workspaces() {
+    NIRI_WS_JSON=$(niri msg -j workspaces 2>/dev/null || echo "[]")
+}
+
+is_ws_open() {
+    local branch="$1"
+    local name
+    name=$(ws_name "$branch")
+    jq -e --arg n "$name" 'any(.[]; .name == $n)' <<< "$NIRI_WS_JSON" &>/dev/null
+}
+
+index_of_branch() {
+    local target="$1"
+    for i in "${!WT_BRANCHES[@]}"; do
+        if [[ "${WT_BRANCHES[$i]}" == "$target" ]]; then
+            echo "$i"
+            return
+        fi
+    done
+    echo "-1"
+}
+
+# Check if a branch is in the excluded list
+is_excluded_branch() {
+    local branch="$1"
+    local excluded
+    for excluded in $EXCLUDED_BRANCHES; do
+        [[ "$branch" == "$excluded" ]] && return 0
+    done
+    return 1
+}
+
+# Launch an app via niri using a command template
+# Replaces {dir} with worktree path and {url} with browser URL
+launch_app() {
+    local template="$1" dir="${2:-}" url="${3:-}"
+    local cmd="${template//\{dir\}/$dir}"
+    cmd="${cmd//\{url\}/$url}"
+    # Word splitting is intentional here
+    # shellcheck disable=SC2086
+    niri msg action spawn -- $cmd
+}
+
+niri_open_workspace() {
+    local branch="$1" wt_dir="$2"
+    local name
+    name=$(ws_name "$branch")
+    step "Setting up Niri workspace '${name}'..."
+
+    niri msg action focus-workspace 255
+    niri msg action set-workspace-name "$name"
+
+    if [[ -n "$EDITOR_CMD" ]]; then
+        sleep 0.3
+        launch_app "$EDITOR_CMD" "$wt_dir"
+    fi
+
+    if [[ -n "$TERMINAL_CMD" ]]; then
+        sleep 0.3
+        launch_app "$TERMINAL_CMD" "$wt_dir"
+    fi
+
+    if [[ -n "$BROWSER_CMD" && -n "$BROWSER_URL" ]]; then
+        sleep 0.3
+        launch_app "$BROWSER_CMD" "$wt_dir" "$BROWSER_URL"
+    fi
+
+    done_ "Workspace '${name}' launched"
+}
+
+niri_focus_workspace() {
+    local branch="$1"
+    local name
+    name=$(ws_name "$branch")
+    niri msg action focus-workspace "$name" 2>/dev/null || {
+        err "Could not focus workspace '${name}'"
+        return 1
+    }
+    done_ "Focused workspace '${name}'"
+}
+
+niri_close_workspace() {
+    local branch="$1"
+    local name
+    name=$(ws_name "$branch")
+    step "Closing workspace '${name}'..."
+
+    local ws_json
+    ws_json=$(niri msg -j workspaces 2>/dev/null || echo "[]")
+
+    local ws_id
+    ws_id=$(jq -r --arg name "$name" '.[] | select(.name == $name) | .id' <<< "$ws_json")
+
+    if [[ -z "$ws_id" || "$ws_id" == "null" ]]; then
+        warn "Workspace '${name}' not found, may already be closed"
+        return 0
+    fi
+
+    # Close all windows on this workspace
+    local win_ids
+    win_ids=$(niri msg -j windows 2>/dev/null | jq -r --argjson ws "$ws_id" '.[] | select(.workspace_id == $ws) | .id')
+
+    for win_id in $win_ids; do
+        niri msg action close-window --id "$win_id" 2>/dev/null || true
+        sleep 0.3
+    done
+
+    sleep 0.5
+    niri msg action unset-workspace-name "$name" 2>/dev/null || true
+
+    done_ "Workspace '${name}' closed"
+}
+
+# ===== Subcommands =====
+
+cmd_create() {
+    preflight
+
+    # Ensure all remote branches are fetched (fix narrow refspec from --single-branch clones)
+    step "Fetching from origin..."
+    git config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+    git fetch origin --prune
+
+    # Step 1: Choose mode
+    local mode_choice
+    mode_choice=$(printf '%s\n' "Create new branch" "Checkout remote branch" | fzf \
+        --header="What do you want to do?" \
+        --prompt="Mode: " \
+        --height=20% \
+        --reverse) || { echo "Cancelled."; exit 0; }
+
+    local BRANCH MODE
+
+    if [[ "$mode_choice" == "Create new branch" ]]; then
+        read -rp "Branch name: " BRANCH
+        if [[ -z "$BRANCH" ]]; then
+            err "Branch name cannot be empty"
+            exit 1
+        fi
+        MODE="new"
+    else
+        # Search existing remote branches
+        declare -a CHECKED_OUT=()
+        while IFS= read -r line; do
+            local branch
+            branch=$(echo "$line" | sed -n 's/.*\[//;s/\]//p')
+            [[ -n "$branch" ]] && CHECKED_OUT+=("$branch")
+        done < <(git worktree list)
+
+        _is_checked_out() {
+            local target="$1"
+            for co in "${CHECKED_OUT[@]}"; do
+                [[ "$co" == "$target" ]] && return 0
+            done
+            return 1
+        }
+
+        declare -a FZF_LINES=()
+        while IFS= read -r line; do
+            local branch="${line#origin/}"
+            [[ "$branch" == "HEAD" ]] && continue
+            is_excluded_branch "$branch" && continue
+            if _is_checked_out "$branch"; then
+                FZF_LINES+=("$(printf "${GREEN}●${NC} %s" "$branch")")
+            else
+                FZF_LINES+=("$(printf "  %s" "$branch")")
+            fi
+        done < <(git branch -r --sort=-committerdate --format='%(refname:short)')
+
+        local selection
+        selection=$(printf '%b\n' "${FZF_LINES[@]}" | fzf \
+            --header="Select a remote branch  (● = active worktree)" \
+            --prompt="Search: " \
+            --height=50% \
+            --reverse \
+            --ansi) || { echo "Cancelled."; exit 0; }
+
+        # Strip ANSI codes and indicator to get branch name
+        BRANCH=$(sed 's/\x1b\[[0-9;]*m//g' <<< "$selection" | sed 's/^● //;s/^  //')
+
+        # If branch already has a worktree, go to its action menu
+        if _is_checked_out "$BRANCH"; then
+            gather_worktrees
+            get_niri_workspaces
+            local idx
+            idx=$(index_of_branch "$BRANCH")
+            if [[ "$idx" == "-1" ]]; then
+                err "Could not find worktree for '${BRANCH}'"
+                exit 1
+            fi
+            worktree_action_menu "$BRANCH" "$idx"
+            return
+        fi
+        MODE="remote"
+    fi
+
+    local WORKTREE_DIR="$WORKTREE_BASE/${WT_PREFIX}-${BRANCH}"
+
+    # Validate
+    if [[ -d "$WORKTREE_DIR" ]]; then
+        err "Worktree directory already exists: $WORKTREE_DIR"
+        exit 1
+    fi
+
+    mkdir -p "$WORKTREE_BASE"
+
+    # Create worktree
+    if [[ "$MODE" == "new" ]]; then
+        if git show-ref --verify --quiet "refs/heads/${BRANCH}" 2>/dev/null; then
+            err "Branch '${BRANCH}' already exists locally"
+            exit 1
+        fi
+        step "Creating worktree (new branch from ${BASE_BRANCH})..."
+        git worktree add "$WORKTREE_DIR" -b "$BRANCH" "$BASE_BRANCH"
+    else
+        step "Creating worktree from remote branch '${BRANCH}'..."
+        # Remove stale local branch if it exists (not checked out — already filtered)
+        if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+            git branch -D "$BRANCH"
+        fi
+        git worktree add --track -b "$BRANCH" "$WORKTREE_DIR" "origin/$BRANCH"
+    fi
+
+    # Copy configured files from main repo
+    for file in $COPY_FILES; do
+        if [[ -f "$MAIN_REPO/$file" ]]; then
+            step "Copying ${file} to worktree..."
+            cp "$MAIN_REPO/$file" "$WORKTREE_DIR/$file"
+            done_ "${file} copied"
+        else
+            info "No ${file} found in main repo, skipping"
+        fi
+    done
+
+    # Run post-create command
+    if [[ -n "$POST_CREATE_CMD" ]]; then
+        step "Running: ${POST_CREATE_CMD}..."
+        (cd "$WORKTREE_DIR" && eval "$POST_CREATE_CMD")
+        done_ "Post-create command finished"
+    fi
+
+    # Open niri workspace
+    niri_open_workspace "$BRANCH" "$WORKTREE_DIR"
+
+    # Summary
+    echo ""
+    done_ "Worktree ready!"
+    info "  Branch:    ${BRANCH}"
+    info "  Worktree:  ${WORKTREE_DIR}"
+    info "  Mode:      ${MODE}"
+}
+
+cmd_list() {
+    preflight
+    gather_worktrees
+    get_niri_workspaces
+
+    if [[ ${#WT_BRANCHES[@]} -eq 0 ]]; then
+        info "No active worktrees found."
+        exit 0
+    fi
+
+    # Build fzf lines
+    local lines=()
+    for i in "${!WT_BRANCHES[@]}"; do
+        local branch="${WT_BRANCHES[$i]}"
+        local rel="${WT_RELATIVE[$i]}"
+        local commit="${WT_COMMITS[$i]}"
+        local status="      "
+        if is_ws_open "$branch"; then
+            status="${GREEN}[OPEN]${NC}"
+        fi
+        lines+=("$(printf "${status}  ${BOLD}%-40s${NC}  ${DIM}%-8s${NC}  ${DIM}%s${NC}" "$branch" "$rel" "$commit")")
+    done
+
+    local selection
+    selection=$(printf '%b\n' "${lines[@]}" | fzf \
+        --header=$'Active Worktrees (sorted by last commit)\n\nENTER to select  ·  ESC to cancel' \
+        --prompt="Worktree: " \
+        --height=60% \
+        --reverse \
+        --ansi \
+        --no-multi) || { echo "Cancelled."; exit 0; }
+
+    # Extract branch name - strip ANSI codes, then parse
+    local clean_line
+    clean_line=$(sed 's/\x1b\[[0-9;]*m//g' <<< "$selection")
+    local branch
+    branch=$(awk '{for(i=1;i<=NF;i++){if($i!="[OPEN]"){print $i; exit}}}' <<< "$clean_line")
+
+    local idx
+    idx=$(index_of_branch "$branch")
+    if [[ "$idx" == "-1" ]]; then
+        err "Could not find branch '${branch}'"
+        exit 1
+    fi
+
+    worktree_action_menu "$branch" "$idx"
+}
+
+worktree_action_menu() {
+    local branch="$1" idx="$2"
+    local wt_dir="${WT_PATHS[$idx]}"
+
+    local actions=()
+    if is_ws_open "$branch"; then
+        actions+=("Focus workspace" "Open fresh workspace" "Delete/Archive")
+    else
+        actions+=("Open workspace" "Delete/Archive")
+    fi
+
+    local action
+    action=$(printf '%s\n' "${actions[@]}" | fzf \
+        --header="Worktree: ${branch}" \
+        --prompt="Action: " \
+        --height=30% \
+        --reverse) || { echo "Cancelled."; exit 0; }
+
+    case "$action" in
+        "Focus workspace")
+            niri_focus_workspace "$branch"
+            ;;
+        "Open workspace"|"Open fresh workspace")
+            niri_open_workspace "$branch" "$wt_dir"
+            ;;
+        "Delete/Archive")
+            cmd_delete "$branch"
+            ;;
+    esac
+}
+
+cmd_delete() {
+    preflight
+
+    local BRANCH
+
+    # Resolve branch name
+    if [[ $# -ge 1 ]]; then
+        BRANCH="$1"
+    elif [[ "$PWD" =~ ${WORKTREE_BASE}/${WT_PREFIX}-(.+)$ ]]; then
+        BRANCH="${BASH_REMATCH[1]}"
+    else
+        # If no arg and not in a worktree, show list for selection
+        gather_worktrees
+        get_niri_workspaces
+
+        if [[ ${#WT_BRANCHES[@]} -eq 0 ]]; then
+            info "No active worktrees found."
+            exit 0
+        fi
+
+        local lines=()
+        for i in "${!WT_BRANCHES[@]}"; do
+            local b="${WT_BRANCHES[$i]}"
+            local rel="${WT_RELATIVE[$i]}"
+            local commit="${WT_COMMITS[$i]}"
+            local status="      "
+            if is_ws_open "$b"; then
+                status="${GREEN}[OPEN]${NC}"
+            fi
+            lines+=("$(printf "${status}  ${BOLD}%-40s${NC}  ${DIM}%-8s${NC}  ${DIM}%s${NC}" "$b" "$rel" "$commit")")
+        done
+
+        local selection
+        selection=$(printf '%b\n' "${lines[@]}" | fzf \
+            --header=$'Select worktree to delete/archive\n\nENTER to select  ·  ESC to cancel' \
+            --prompt="Delete: " \
+            --height=60% \
+            --reverse \
+            --ansi \
+            --no-multi) || { echo "Cancelled."; exit 0; }
+
+        local clean_line
+        clean_line=$(sed 's/\x1b\[[0-9;]*m//g' <<< "$selection")
+        BRANCH=$(awk '{for(i=1;i<=NF;i++){if($i!="[OPEN]"){print $i; exit}}}' <<< "$clean_line")
+    fi
+
+    local WORKTREE_DIR
+    WORKTREE_DIR=$(resolve_wt_dir "$BRANCH")
+
+    # Pre-flight checks
+    if [[ ! -d "$WORKTREE_DIR" ]]; then
+        err "Worktree not found: $WORKTREE_DIR"
+        exit 1
+    fi
+
+    if ! git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+        err "Branch '${BRANCH}' does not exist"
+        exit 1
+    fi
+
+    # Summary
+    echo ""
+    info "Branch:    ${BRANCH}"
+    info "Worktree:  ${WORKTREE_DIR}"
+    echo ""
+    info "Recent commits on '${BRANCH}':"
+    git log --oneline -5 "$BRANCH" | sed 's/^/         /'
+    echo ""
+
+    # Prompt for action
+    echo -e "${CYAN}What do you want to do?${NC}"
+    echo "  [1] Merge into ${MERGE_TARGET} (merge + push + cleanup)"
+    echo "  [2] Archive (cleanup only)"
+    echo ""
+    read -rp "Choice [1/2]: " choice
+
+    case "$choice" in
+        1)
+            # === Merge & Push ===
+            step "Preparing to merge into ${MERGE_TARGET}..."
+
+            # Check worktree is clean
+            if ! git -C "$WORKTREE_DIR" diff --quiet || ! git -C "$WORKTREE_DIR" diff --cached --quiet; then
+                err "Worktree has uncommitted changes. Commit or stash them first."
+                exit 1
+            fi
+
+            # Warn about untracked files
+            local UNTRACKED
+            UNTRACKED=$(git -C "$WORKTREE_DIR" ls-files --others --exclude-standard)
+            if [[ -n "$UNTRACKED" ]]; then
+                warn "Worktree has untracked files:"
+                echo "$UNTRACKED" | sed 's/^/         /'
+                read -rp "Continue anyway? [y/N] " answer
+                if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+                    info "Aborted."
+                    exit 0
+                fi
+            fi
+
+            # Save current branch for restore
+            local ORIGINAL_BRANCH
+            ORIGINAL_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --short HEAD)
+
+            # Push worktree branch to origin
+            step "Pushing '${BRANCH}' to origin..."
+            git -C "$WORKTREE_DIR" push -u origin "$BRANCH"
+            done_ "Branch '${BRANCH}' pushed"
+
+            # Fetch + checkout merge target + pull
+            step "Fetching origin and updating ${MERGE_TARGET}..."
+            git fetch origin
+            git checkout "$MERGE_TARGET"
+            git pull origin "$MERGE_TARGET"
+
+            # Merge with editable commit message
+            local DEFAULT_MSG="Merge ${BRANCH} into ${MERGE_TARGET}"
+            echo ""
+            info "Merge commit message (edit or press Enter to accept):"
+            local MERGE_MSG
+            read -r -e -i "$DEFAULT_MSG" MERGE_MSG
+            [[ -z "$MERGE_MSG" ]] && MERGE_MSG="$DEFAULT_MSG"
+
+            step "Merging '${BRANCH}' into ${MERGE_TARGET}..."
+            if ! git merge "$BRANCH" -m "$MERGE_MSG"; then
+                echo ""
+                err "Merge conflict detected!"
+                echo ""
+                info "Resolve conflicts manually, then:"
+                info "  1. Fix conflicted files"
+                info "  2. git add <resolved files>"
+                info "  3. git commit"
+                info "  4. Clean up: git worktree remove ${WORKTREE_DIR}"
+                info "  5. Delete branch: git branch -D ${BRANCH}"
+                exit 1
+            fi
+            done_ "Merge successful"
+
+            # Push merge target
+            step "Pushing ${MERGE_TARGET} to origin..."
+            git push origin "$MERGE_TARGET"
+            done_ "Pushed"
+
+            # Cleanup worktree
+            step "Removing worktree at ${WORKTREE_DIR}..."
+            git worktree remove "$WORKTREE_DIR"
+            done_ "Worktree removed"
+
+            step "Deleting branch '${BRANCH}'..."
+            git branch -D "$BRANCH"
+            done_ "Branch deleted"
+
+            # Close niri workspace
+            niri_close_workspace "$BRANCH"
+
+            # Restore original branch
+            step "Restoring to branch '${ORIGINAL_BRANCH}'..."
+            git checkout "$ORIGINAL_BRANCH"
+            done_ "Restored to '${ORIGINAL_BRANCH}'"
+
+            echo ""
+            done_ "Merge complete!"
+            info "  Branch '${BRANCH}' merged into ${MERGE_TARGET} and cleaned up"
+            ;;
+
+        2)
+            # === Archive ===
+            local FORCE_REMOVE=false
+
+            # Check for uncommitted changes
+            if ! git -C "$WORKTREE_DIR" diff --quiet 2>/dev/null || ! git -C "$WORKTREE_DIR" diff --cached --quiet 2>/dev/null; then
+                warn "Worktree has uncommitted changes — they will be lost!"
+                read -rp "Continue anyway? [y/N] " answer
+                if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+                    info "Aborted."
+                    exit 0
+                fi
+                FORCE_REMOVE=true
+            fi
+
+            # Cleanup worktree
+            step "Removing worktree at ${WORKTREE_DIR}..."
+            if [[ "$FORCE_REMOVE" == true ]]; then
+                git worktree remove --force "$WORKTREE_DIR"
+            else
+                git worktree remove "$WORKTREE_DIR"
+            fi
+            done_ "Worktree removed"
+
+            step "Deleting branch '${BRANCH}'..."
+            git branch -D "$BRANCH"
+            done_ "Branch deleted"
+
+            # Close niri workspace
+            niri_close_workspace "$BRANCH"
+
+            echo ""
+            done_ "Archive complete!"
+            info "  Branch '${BRANCH}' removed (not merged)"
+            ;;
+
+        *)
+            err "Invalid choice. Please enter 1 or 2."
+            exit 1
+            ;;
+    esac
+}
+
+cmd_menu() {
+    preflight
+    gather_worktrees
+    get_niri_workspaces
+
+    # Build menu items
+    local items=()
+    items+=("${GREEN}+${NC} ${BOLD}Create new worktree${NC}")
+
+    for i in "${!WT_BRANCHES[@]}"; do
+        local branch="${WT_BRANCHES[$i]}"
+        local rel="${WT_RELATIVE[$i]}"
+        local status=""
+        if is_ws_open "$branch"; then
+            status=" ${GREEN}[OPEN]${NC}"
+        fi
+        items+=("  ${BOLD}${branch}${NC}${status}  ${DIM}(${rel})${NC}")
+    done
+
+    local selection
+    selection=$(printf '%b\n' "${items[@]}" | fzf \
+        --header=$'wk - Workspace Manager\n\nENTER to select  ·  ESC to cancel' \
+        --prompt="Action: " \
+        --height=60% \
+        --reverse \
+        --ansi \
+        --no-multi) || { echo "Cancelled."; exit 0; }
+
+    # Strip ANSI for matching
+    local clean
+    clean=$(sed 's/\x1b\[[0-9;]*m//g' <<< "$selection")
+
+    if [[ "$clean" =~ ^"+ Create new worktree"$ ]] || [[ "$clean" =~ "Create new worktree" ]]; then
+        cmd_create
+        return
+    fi
+
+    # Extract branch name
+    local branch
+    branch=$(awk '{for(i=1;i<=NF;i++){if($i!="[OPEN]" && $i!="+" && !match($i,/^\(/)){print $i; exit}}}' <<< "$clean")
+
+    local idx
+    idx=$(index_of_branch "$branch")
+    if [[ "$idx" == "-1" ]]; then
+        err "Could not find branch '${branch}'"
+        exit 1
+    fi
+
+    worktree_action_menu "$branch" "$idx"
+}
+
+# ===== Dispatch =====
+
+case "${1:-}" in
+    create)     shift; cmd_create "$@" ;;
+    list|ls)    shift; cmd_list "$@" ;;
+    delete|rm|close) shift; cmd_delete "$@" ;;
+    "")         cmd_menu ;;
+    *)          err "Unknown command: $1"; echo ""; usage; exit 1 ;;
+esac

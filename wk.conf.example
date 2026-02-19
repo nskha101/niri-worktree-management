@@ -1,0 +1,83 @@
+# wk - Niri Worktree Manager
+# Configuration file: ~/.config/wk/wk.conf
+#
+# This file is sourced by bash, so you can use environment variables
+# and shell expansions (e.g., $HOME, $(command)).
+
+# ==============================================================================
+# Repository Settings
+# ==============================================================================
+
+# REQUIRED: Path to your main git repository
+MAIN_REPO="$HOME/Code/my-project"
+
+# Base directory where worktrees are created
+# Each worktree becomes: $WORKTREE_BASE/$WT_PREFIX-$BRANCH_NAME
+WORKTREE_BASE="$HOME/worktrees"
+
+# Prefix for worktree directory names (default: repo directory name)
+# Example: WT_PREFIX="myproj" creates ~/worktrees/myproj-feature-branch
+WT_PREFIX=""
+
+# Branch to create new branches from
+BASE_BRANCH="origin/main"
+
+# Branch to merge into when finishing a worktree (option 1 in delete menu)
+MERGE_TARGET="main"
+
+# Branches to exclude from the remote branch picker (space-separated)
+EXCLUDED_BRANCHES="main"
+
+# ==============================================================================
+# Worktree Setup
+# ==============================================================================
+
+# Files to copy from main repo to new worktrees (space-separated)
+# Commonly used for environment files that aren't committed to git
+COPY_FILES=".env"
+
+# Command to run after creating a worktree (leave empty to skip)
+# Runs inside the new worktree directory
+# Examples:
+#   POST_CREATE_CMD="npm install"
+#   POST_CREATE_CMD="pnpm install"
+#   POST_CREATE_CMD="yarn install"
+#   POST_CREATE_CMD="pip install -r requirements.txt"
+POST_CREATE_CMD=""
+
+# ==============================================================================
+# Workspace Apps
+# ==============================================================================
+
+# Commands to launch in the Niri workspace when opening a worktree.
+# Use {dir} as a placeholder for the worktree path.
+# Use {url} as a placeholder for BROWSER_URL.
+# Leave empty to skip launching that app.
+#
+# Terminal examples:
+#   TERMINAL_CMD="ghostty --working-directory={dir}"
+#   TERMINAL_CMD="kitty --directory {dir}"
+#   TERMINAL_CMD="alacritty --working-directory {dir}"
+#   TERMINAL_CMD="foot --working-directory={dir}"
+#   TERMINAL_CMD="wezterm start --cwd {dir}"
+
+EDITOR_CMD="code {dir}"
+TERMINAL_CMD=""
+BROWSER_CMD=""
+BROWSER_URL=""
+
+# ==============================================================================
+# Dev Server (used by the `dev` companion script)
+# ==============================================================================
+
+# Ports to kill before starting the dev server (space-separated)
+# Leave empty to skip port cleanup
+DEV_PORTS=""
+
+# Command to start the dev server
+# Examples:
+#   DEV_CMD="npm run dev"
+#   DEV_CMD="pnpm dev"
+#   DEV_CMD="cargo watch -x run"
+#   DEV_CMD="python manage.py runserver"
+DEV_CMD=""

@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ===== Configuration =====
+WK_CONFIG="${WK_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/wk/wk.conf}"
+
+# Defaults
+DEV_PORTS=""
+DEV_CMD=""
+
+# Load user config
+if [[ -f "$WK_CONFIG" ]]; then
+    # shellcheck source=/dev/null
+    source "$WK_CONFIG"
+fi
+
+# ===== Colors & Logging =====
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[0;33m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+info()  { echo -e "${BLUE}[info]${NC}  $*"; }
+done_() { echo -e "${GREEN}[done]${NC}  $*"; }
+warn()  { echo -e "${YELLOW}[warn]${NC}  $*"; }
+err()   { echo -e "${RED}[error]${NC} $*" >&2; }
+
+if [[ -z "$DEV_CMD" ]]; then
+    err "DEV_CMD is not set. Configure it in $WK_CONFIG"
+    exit 1
+fi
+
+# Read ports into array
+read -ra PORTS <<< "$DEV_PORTS"
+
+if [[ ${#PORTS[@]} -gt 0 && -n "${PORTS[0]}" ]]; then
+    # Check and kill existing processes on managed ports
+    found_any=false
+
+    for port in "${PORTS[@]}"; do
+        pids=$(lsof -ti :"$port" 2>/dev/null || true)
+        if [[ -n "$pids" ]]; then
+            found_any=true
+            for pid in $pids; do
+                cmd=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+                warn "Port ${BOLD}${port}${NC}${YELLOW} occupied by ${BOLD}${cmd}${NC}${YELLOW} (PID ${pid})"
+            done
+        fi
+    done
+
+    if [[ "$found_any" == true ]]; then
+        info "Killing existing dev servers..."
+        for port in "${PORTS[@]}"; do
+            pids=$(lsof -ti :"$port" 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then
+                kill $pids 2>/dev/null || true
+            fi
+        done
+
+        # Brief wait, then force-kill any survivors
+        sleep 1
+        for port in "${PORTS[@]}"; do
+            pids=$(lsof -ti :"$port" 2>/dev/null || true)
+            if [[ -n "$pids" ]]; then
+                kill -9 $pids 2>/dev/null || true
+            fi
+        done
+
+        done_ "Ports cleared"
+        echo ""
+    fi
+fi
+
+# Start dev server
+info "Starting ${BOLD}${DEV_CMD}${NC} in ${BOLD}$(pwd)${NC}"
+# shellcheck disable=SC2086
+exec $DEV_CMD
