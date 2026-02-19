@@ -22,7 +22,7 @@ Git worktree manager for [Niri](https://github.com/YaLTeR/niri). Create, manage,
 ### 1. Install
 
 ```bash
-git clone https://github.com/YOUR_USER/niri-worktree-management.git
+git clone https://github.com/nskha101/niri-worktree-management.git
 cd niri-worktree-management
 chmod +x install.sh
 ./install.sh
