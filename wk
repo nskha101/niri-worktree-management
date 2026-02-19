@@ -638,10 +638,20 @@ cmd_delete() {
             # === Merge & Push ===
             step "Preparing to merge into ${MERGE_TARGET}..."
 
-            # Check worktree is clean
+            # Check for uncommitted changes and commit them
             if ! git -C "$WORKTREE_DIR" diff --quiet || ! git -C "$WORKTREE_DIR" diff --cached --quiet; then
-                err "Worktree has uncommitted changes. Commit or stash them first."
-                exit 1
+                warn "Worktree has uncommitted changes"
+                git -C "$WORKTREE_DIR" status --short | sed 's/^/         /'
+                echo ""
+                local COMMIT_MSG
+                read -r -e -p "Commit message (empty to abort): " COMMIT_MSG
+                if [[ -z "$COMMIT_MSG" ]]; then
+                    info "Aborted."
+                    exit 0
+                fi
+                git -C "$WORKTREE_DIR" add -A
+                git -C "$WORKTREE_DIR" commit -m "$COMMIT_MSG"
+                done_ "Changes committed"
             fi
 
             # Warn about untracked files
@@ -650,10 +660,15 @@ cmd_delete() {
             if [[ -n "$UNTRACKED" ]]; then
                 warn "Worktree has untracked files:"
                 echo "$UNTRACKED" | sed 's/^/         /'
-                read -rp "Continue anyway? [y/N] " answer
-                if [[ ! "$answer" =~ ^[Yy]$ ]]; then
-                    info "Aborted."
-                    exit 0
+                read -rp "Include them in a commit? [y/N] " answer
+                if [[ "$answer" =~ ^[Yy]$ ]]; then
+                    local COMMIT_MSG
+                    read -r -e -p "Commit message: " COMMIT_MSG
+                    if [[ -n "$COMMIT_MSG" ]]; then
+                        git -C "$WORKTREE_DIR" add -A
+                        git -C "$WORKTREE_DIR" commit -m "$COMMIT_MSG"
+                        done_ "Untracked files committed"
+                    fi
                 fi
             fi
 
