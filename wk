@@ -439,7 +439,7 @@ cmd_create() {
             exit 1
         fi
         step "Creating worktree (new branch from ${BASE_BRANCH})..."
-        git worktree add "$WORKTREE_DIR" -b "$BRANCH" "$BASE_BRANCH"
+        git worktree add --no-track "$WORKTREE_DIR" -b "$BRANCH" "$BASE_BRANCH"
     else
         step "Creating worktree from remote branch '${BRANCH}'..."
         # Remove stale local branch if it exists (not checked out — already filtered)
