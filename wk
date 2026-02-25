@@ -532,7 +532,7 @@ worktree_action_menu() {
 
     local actions=()
     if is_ws_open "$branch"; then
-        actions+=("Focus workspace" "Open fresh workspace" "Delete/Archive")
+        actions+=("Focus workspace" "Open fresh workspace" "Close workspace" "Delete/Archive")
     else
         actions+=("Open workspace" "Delete/Archive")
     fi
@@ -550,6 +550,9 @@ worktree_action_menu() {
             ;;
         "Open workspace"|"Open fresh workspace")
             niri_open_workspace "$branch" "$wt_dir"
+            ;;
+        "Close workspace")
+            niri_close_workspace "$branch"
             ;;
         "Delete/Archive")
             cmd_delete "$branch"
@@ -630,8 +633,9 @@ cmd_delete() {
     echo -e "${CYAN}What do you want to do?${NC}"
     echo "  [1] Merge into ${MERGE_TARGET} (merge + push + cleanup)"
     echo "  [2] Archive (cleanup only)"
+    echo "  [3] Close workspace (keep worktree and branch)"
     echo ""
-    read -rp "Choice [1/2]: " choice
+    read -rp "Choice [1/2/3]: " choice
 
     case "$choice" in
         1)
@@ -773,8 +777,17 @@ cmd_delete() {
             info "  Branch '${BRANCH}' removed (not merged)"
             ;;
 
+        3)
+            # === Close workspace only ===
+            niri_close_workspace "$BRANCH"
+
+            echo ""
+            done_ "Workspace closed!"
+            info "  Worktree and branch '${BRANCH}' are still available"
+            ;;
+
         *)
-            err "Invalid choice. Please enter 1 or 2."
+            err "Invalid choice. Please enter 1, 2, or 3."
             exit 1
             ;;
     esac
