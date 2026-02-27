@@ -8,6 +8,7 @@ Git worktree manager for [Niri](https://github.com/YaLTeR/niri). Create, manage,
 - **Niri workspace integration** — each worktree gets a dedicated named workspace
 - **Branch management** — create new branches or check out existing remote ones
 - **Clean deletion** — merge into your target branch and push, or archive without merging
+- **Linear integration** — create branches directly from Linear tickets with fuzzy search and preview
 - **Fully configurable** — repo path, apps, commands, and workflow in a single config file
 
 ## Requirements
@@ -16,6 +17,7 @@ Git worktree manager for [Niri](https://github.com/YaLTeR/niri). Create, manage,
 - [fzf](https://github.com/junegunn/fzf) — fuzzy finder
 - [jq](https://github.com/jqlang/jq) — JSON processor
 - git
+- [curl](https://curl.se/) — for Linear API requests (optional, only if using Linear integration)
 
 ## Setup
 
@@ -88,6 +90,7 @@ See [wk.conf.example](wk.conf.example) for all options with documentation.
 | `TERMINAL_CMD` | *(empty)* | Terminal to launch (`{dir}` = worktree path) |
 | `BROWSER_CMD` | *(empty)* | Browser to launch (`{url}` = BROWSER_URL) |
 | `BROWSER_URL` | *(empty)* | URL to open in browser (e.g. `http://localhost:3000`) |
+| `LINEAR_API_KEY` | *(empty)* | Linear personal API key (enables "Create from Linear ticket") |
 
 ### Terminal examples
 
@@ -136,7 +139,7 @@ Opens an interactive fzf menu showing all active worktrees with status indicator
 $ wk create
 ```
 
-Choose to create a new branch (forked from `BASE_BRANCH`) or check out an existing remote branch. The command:
+Choose to create a new branch, check out an existing remote branch, or create from a Linear ticket (if `LINEAR_API_KEY` is configured). The command:
 
 1. Creates a git worktree in `$WORKTREE_BASE`
 2. Copies configured files (e.g. `.env`)
@@ -170,6 +173,28 @@ $ wk init
 ```
 
 Creates a config file at `~/.config/wk/wk.conf` from the example template and opens it in your editor.
+
+## Linear Integration
+
+Create worktree branches directly from Linear tickets. When enabled, `wk create` shows a third option: **Create from Linear ticket**.
+
+### Setup
+
+1. Get a personal API key from **Linear → Settings → Security & access → Personal API keys**
+2. Add it to your config:
+
+```bash
+# ~/.config/wk/wk.conf
+LINEAR_API_KEY="lin_api_..."
+```
+
+### How it works
+
+1. Run `wk create` and select "Create from Linear ticket"
+2. Issues are fetched and displayed in fzf — your assigned issues appear first (marked with ★)
+3. Hover over any ticket to see a preview with state, priority, assignee, labels, and description
+4. Select a ticket and the branch name is auto-generated from the identifier and title (e.g. `eng-123-fix-login-bug`)
+5. Edit the branch name or press enter to accept, then worktree creation proceeds as normal
 
 ## Companion: `dev`
 

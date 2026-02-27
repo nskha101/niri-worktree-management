@@ -17,6 +17,7 @@ EDITOR_CMD="code {dir}"
 TERMINAL_CMD=""
 BROWSER_CMD=""
 BROWSER_URL=""
+LINEAR_API_KEY=""
 
 # Load user config
 if [[ -f "$WK_CONFIG" ]]; then
@@ -113,7 +114,7 @@ case "${1:-}" in
 esac
 
 # Validate required config
-if [[ -z "$MAIN_REPO" ]]; then
+if [[ -z "$MAIN_REPO" && "${1:-}" != "_linear-preview" ]]; then
     err "MAIN_REPO is not set."
     echo -e "  Configure it in: ${BOLD}${WK_CONFIG}${NC}" >&2
     echo -e "  Run ${BOLD}wk init${NC} to create a config file." >&2
@@ -339,6 +340,164 @@ niri_close_workspace() {
     done_ "Workspace '${name}' closed"
 }
 
+# ===== Linear Integration =====
+
+slugify() {
+    local text="$1"
+    echo "$text" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed 's/[^a-z0-9]/-/g; s/-\+/-/g; s/^-//; s/-$//'
+}
+
+linear_query() {
+    local query="$1"
+    local variables="${2:-}"
+    local body
+    if [[ -n "$variables" ]]; then
+        body=$(jq -n --arg q "$query" --argjson v "$variables" '{query: $q, variables: $v}')
+    else
+        body=$(jq -n --arg q "$query" '{query: $q}')
+    fi
+    curl -s -X POST https://api.linear.app/graphql \
+        -H "Content-Type: application/json" \
+        -H "Authorization: $LINEAR_API_KEY" \
+        -d "$body"
+}
+
+linear_fetch_issues() {
+    local assigned_response all_response
+
+    assigned_response=$(linear_query '{
+        viewer {
+            assignedIssues(
+                filter: { state: { type: { nin: ["completed", "canceled"] } } }
+                first: 50
+                orderBy: updatedAt
+            ) {
+                nodes {
+                    identifier
+                    title
+                    state { name }
+                    priorityLabel
+                }
+            }
+        }
+    }')
+
+    # Check for API errors
+    local errors
+    errors=$(jq -r '.errors[0].message // empty' <<< "$assigned_response" 2>/dev/null)
+    if [[ -n "$errors" ]]; then
+        err "Linear API error: $errors" >&2
+        return 1
+    fi
+
+    all_response=$(linear_query '{
+        issues(
+            filter: { state: { type: { nin: ["completed", "canceled"] } } }
+            first: 100
+            orderBy: updatedAt
+        ) {
+            nodes {
+                identifier
+                title
+                state { name }
+                priorityLabel
+            }
+        }
+    }')
+
+    # Build assigned identifiers for deduplication
+    local assigned_ids
+    assigned_ids=$(jq -r '.data.viewer.assignedIssues.nodes[].identifier // empty' <<< "$assigned_response" 2>/dev/null || true)
+
+    # Print assigned issues first (★ marker)
+    jq -r '.data.viewer.assignedIssues.nodes[] | "\u2605 \(.identifier) | \(.title) | [\(.state.name)] | \(.priorityLabel)"' <<< "$assigned_response" 2>/dev/null || true
+
+    # Print remaining issues (excluding assigned ones)
+    if [[ -n "$assigned_ids" ]]; then
+        local filter_array
+        filter_array=$(jq -Rn '[inputs]' <<< "$assigned_ids")
+        jq -r --argjson ids "$filter_array" '
+            .data.issues.nodes[] |
+            select(.identifier as $id | $ids | index($id) | not) |
+            "  \(.identifier) | \(.title) | [\(.state.name)] | \(.priorityLabel)"
+        ' <<< "$all_response" 2>/dev/null || true
+    else
+        jq -r '.data.issues.nodes[] | "  \(.identifier) | \(.title) | [\(.state.name)] | \(.priorityLabel)"' <<< "$all_response" 2>/dev/null || true
+    fi
+}
+
+linear_preview() {
+    local identifier="$1"
+    local vars response
+    vars=$(jq -n --arg id "$identifier" '{id: $id}')
+    response=$(linear_query 'query($id: String!) {
+        issue(id: $id) {
+            identifier
+            title
+            state { name }
+            priorityLabel
+            assignee { name }
+            labels { nodes { name } }
+            team { name }
+            createdAt
+            description
+        }
+    }' "$vars")
+
+    local error
+    error=$(jq -r '.errors[0].message // empty' <<< "$response" 2>/dev/null)
+    if [[ -n "$error" ]]; then
+        echo "Error: $error"
+        return 1
+    fi
+
+    local title state priority assignee labels team created description
+    title=$(jq -r '.data.issue.title // "N/A"' <<< "$response")
+    state=$(jq -r '.data.issue.state.name // "N/A"' <<< "$response")
+    priority=$(jq -r '.data.issue.priorityLabel // "N/A"' <<< "$response")
+    assignee=$(jq -r '.data.issue.assignee.name // "Unassigned"' <<< "$response")
+    labels=$(jq -r '[.data.issue.labels.nodes[].name] | if length > 0 then join(", ") else "None" end' <<< "$response")
+    team=$(jq -r '.data.issue.team.name // "N/A"' <<< "$response")
+    created=$(jq -r '.data.issue.createdAt // "N/A"' <<< "$response")
+    description=$(jq -r '.data.issue.description // "No description"' <<< "$response")
+
+    if [[ "$created" != "N/A" ]]; then
+        created=$(date -d "$created" "+%Y-%m-%d" 2>/dev/null || echo "$created")
+    fi
+
+    echo -e "${BOLD}${identifier}${NC} — ${title}"
+    echo ""
+    echo -e "  ${CYAN}State:${NC}     ${state}"
+    echo -e "  ${CYAN}Priority:${NC}  ${priority}"
+    echo -e "  ${CYAN}Assignee:${NC}  ${assignee}"
+    echo -e "  ${CYAN}Labels:${NC}    ${labels}"
+    echo -e "  ${CYAN}Team:${NC}      ${team}"
+    echo -e "  ${CYAN}Created:${NC}   ${created}"
+    echo ""
+    echo -e "${CYAN}Description:${NC}"
+    local line_count
+    line_count=$(echo "$description" | wc -l)
+    if (( line_count > 15 )); then
+        echo "$description" | head -15
+        echo "..."
+    else
+        echo "$description"
+    fi
+}
+
+cmd_linear_preview() {
+    local input="$*"
+    local identifier
+    identifier=$(grep -oP '[A-Z]+-[0-9]+' <<< "$input" | head -1)
+    if [[ -z "$identifier" ]]; then
+        echo "No identifier found"
+        return 1
+    fi
+    linear_preview "$identifier"
+}
+
 # ===== Subcommands =====
 
 cmd_create() {
@@ -350,8 +509,13 @@ cmd_create() {
     git fetch origin --prune
 
     # Step 1: Choose mode
+    local mode_options=("Create new branch" "Checkout remote branch")
+    if [[ -n "${LINEAR_API_KEY:-}" ]]; then
+        mode_options+=("Create from Linear ticket")
+    fi
+
     local mode_choice
-    mode_choice=$(printf '%s\n' "Create new branch" "Checkout remote branch" | fzf \
+    mode_choice=$(printf '%s\n' "${mode_options[@]}" | fzf \
         --header="What do you want to do?" \
         --prompt="Mode: " \
         --height=20% \
@@ -365,6 +529,43 @@ cmd_create() {
             err "Branch name cannot be empty"
             exit 1
         fi
+        MODE="new"
+    elif [[ "$mode_choice" == "Create from Linear ticket" ]]; then
+        step "Fetching Linear issues..."
+        local issues
+        issues=$(linear_fetch_issues)
+
+        if [[ -z "$issues" ]]; then
+            err "No issues found or API request failed"
+            exit 1
+        fi
+
+        local wk_cmd
+        wk_cmd=$(readlink -f "$0")
+
+        local selection
+        selection=$(echo "$issues" | fzf \
+            --header=$'Select a Linear ticket  (\u2605 = assigned to you)\n' \
+            --prompt="Search: " \
+            --height=60% \
+            --reverse \
+            --ansi \
+            --preview="$wk_cmd _linear-preview {}" \
+            --preview-window=right:50%:wrap) || { echo "Cancelled."; exit 0; }
+
+        # Extract identifier and title
+        local identifier title
+        identifier=$(grep -oP '[A-Z]+-[0-9]+' <<< "$selection" | head -1)
+        title=$(awk -F' \\| ' '{print $2}' <<< "$selection" | sed 's/^ *//;s/ *$//')
+
+        BRANCH=$(slugify "$identifier-$title")
+
+        info "Branch name: ${BRANCH}"
+        read -rp "Edit? [enter to accept, or type new name]: " new_name
+        if [[ -n "$new_name" ]]; then
+            BRANCH="$new_name"
+        fi
+
         MODE="new"
     else
         # Search existing remote branches
@@ -850,6 +1051,7 @@ case "${1:-}" in
     create)     shift; cmd_create "$@" ;;
     list|ls)    shift; cmd_list "$@" ;;
     delete|rm|close) shift; cmd_delete "$@" ;;
+    _linear-preview) shift; cmd_linear_preview "$@" ;;
     "")         cmd_menu ;;
     *)          err "Unknown command: $1"; echo ""; usage; exit 1 ;;
 esac

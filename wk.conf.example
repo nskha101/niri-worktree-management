@@ -81,3 +81,10 @@ DEV_PORTS=""
 #   DEV_CMD="cargo watch -x run"
 #   DEV_CMD="python manage.py runserver"
 DEV_CMD=""
+
+# ==============================================================================
+# Linear Integration (optional, for "Create from Linear ticket")
+# ==============================================================================
+
+# Personal API key from Linear (Settings → Security & access → Personal API keys)
+LINEAR_API_KEY=""
