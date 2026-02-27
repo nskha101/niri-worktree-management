@@ -104,6 +104,13 @@ Different terminals use different flags for the working directory:
 | Foot | `TERMINAL_CMD="foot --working-directory={dir}"` |
 | WezTerm | `TERMINAL_CMD="wezterm start --cwd {dir}"` |
 
+### Ghostty notes
+
+If you use Ghostty as your terminal, be aware of these settings that affect `wk`:
+
+- **`gtk-single-instance`** — If set to `true` in your Ghostty config, new `ghostty --working-directory=...` spawns are handled by the existing Ghostty process, which may ignore the `--working-directory` flag. Leave this unset or set to `false` for `wk` to work correctly.
+- **`confirm-close-surface`** — When `wk delete` closes a workspace (option 3), the terminal running the script is one of the windows being closed. If `confirm-close-surface` is `false`, Ghostty kills the terminal instantly — before the script finishes cleaning up the workspace name. Set this to `true` so Ghostty prompts before closing, giving the script time to complete.
+
 ### Example config
 
 ```bash
